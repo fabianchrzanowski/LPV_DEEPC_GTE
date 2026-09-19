@@ -1,27 +1,47 @@
-% ========================================================================
+%% ========================================================================
 % setup_simulation_params.m
 % 
-% Master configuration file for the AGTF30 engine controller comparisons.
-% Sourcing this file ensures all controllers (MPC, LPV-MPC, DeePC, LPV-DeePC)
-% run on the exact same trajectory, sample time, and environment settings.
+% This is a configuration file which affects the specification of all the
+% controllers.
+%
+% Set trajectory, Initial steps and prediction horizon
+% Choose from:
+% - QUICK_TEST -> short 140 steps step reference trajectory
+% - MID_TEST -> around 600-700 steps trajectory with increase and decrease
+% of core speed 
+% - LONG_TEST -> around 2000 steps trajectory with big transients, as well
+% as gradual increase and decrease
 % ========================================================================
 
-%% 1. Engine & Environment Settings
-FAST_SURROGATE_MODE = false;  % Set to false to run the slow Simulink model
-
-%% 2. Scenario Settings
-SCENARIO = 'FULL'; % Options: 'QUICK_TEST', 'FULL_VALIDATION', 'FUNKY_TRAJECTORY'
+% Choose the trajectory profile
+if ~exist('SCENARIO', 'var')
+    SCENARIO = 'MID_TEST'; % Options: 'QUICK_TEST', 'MID_TEST', 'LONG_TEST'
+end
 
 %% 3. Timing Parameters
 Ts = 0.015;          % Sample time [s]
-T_ini = 10;          % Warm-up steps for DeePC (must be run for all for fair comparison)
-N_pred = 30;         % Unified prediction horizon for all controllers
+T_ini = 20;          % Initial steps, runs also for lpv-mpc
+N_pred = 30;         % Prediction horizon
 
 if strcmp(SCENARIO, 'QUICK_TEST')
     steps_per_seg = 70;
     n_segments = 2;
-elseif strcmp(SCENARIO, 'FUNKY_TRAJECTORY')
-    % Funky trajectory definition
+elseif strcmp(SCENARIO, 'MID_TEST')
+    % Mid length trajectory: ~600 steps
+    dx_Wf = [0.5*ones(1,5), ...                     % idle hold
+             linspace(0.5, 1.2, 8), ...              % ramp to cruise
+             1.2*ones(1,5), ...                      % cruise hold
+             1.8, 1.8, 1.8, ...                      % step to high
+             linspace(1.8, 0.7, 6), ...              % ramp down
+             0.7, 0.7, 0.7, ...                      % low hold
+             1.5, 0.9, 1.5, 0.9, ...                 % rapid toggles
+             linspace(0.9, 0.5, 4), ...              % ramp back to idle
+             0.5*ones(1,3)];                          % idle settle
+    
+    steps_per_seg = 15;  % 0.225s per segment
+    n_segments = numel(dx_Wf);
+elseif strcmp(SCENARIO, 'LONG_TEST')
+    % Long trajectory: ~2000 steps
     seg1 = 0.5*ones(1,20);                          % idle hold
     seg2 = linspace(0.5, 1.9, 30);                   % ramp idle->max
     seg3 = 1.9*ones(1,15);                           % hold at max
@@ -40,12 +60,13 @@ else
     n_segments = 3;
 end
 
+% simulation steps
 N_sim = n_segments * steps_per_seg;
 N_total = T_ini + N_sim;
 L = T_ini + N_pred;  % DeePC trajectory length
 
-%% 3. Load Identification Data for Equilibriums
-proj = currentProject;
+%% 3. Load Identification Data 
+try; proj = currentProject; catch; proj = openProject('GTE.prj'); end
 models = load(fullfile(proj.RootFolder,'Params','tables','matrices_DE_wf.mat'));
 wf_data = load(fullfile(proj.RootFolder,'Params','test_files_fuel_only','test_identification','wf_values.mat'));
 offset = models.offset;
@@ -82,16 +103,19 @@ z_cruise = offset.z(idx_NH, k_cruise);
 ref = zeros(N_total + N_pred, 1);
 ref(1:T_ini) = z_idle;                            % Warmup
 
+% quick test is a quick step
 if strcmp(SCENARIO, 'QUICK_TEST')
     idx1 = T_ini + 1; idx2 = T_ini + steps_per_seg;   % Idle
     ref(idx1:idx2) = z_idle;
     idx1 = idx2 + 1; idx2 = idx2 + steps_per_seg;     % Gentle Step up
     ref(idx1:end) = z_max;
-elseif strcmp(SCENARIO, 'FUNKY_TRAJECTORY')
+
+% mid test and long test 
+elseif strcmp(SCENARIO, 'MID_TEST') || strcmp(SCENARIO, 'LONG_TEST')
     idx1 = T_ini + 1;
     for i = 1:numel(dx_Wf)
         idx2 = idx1 + steps_per_seg - 1;
-        % Map Wf to tracked output using the offset table
+        % map wf to the spool speed using the data from identification
         z_target = interp1(offset.u(1,:)', offset.z(idx_NH,:)', dx_Wf(i), 'pchip');
         ref(idx1:idx2) = z_target;
         idx1 = idx2 + 1;
@@ -107,7 +131,7 @@ else
 end
 
 fprintf('--- Master Parameters Loaded ---\n');
-fprintf('Fast Surrogate Mode: %d\n', FAST_SURROGATE_MODE);
 fprintf('N_pred: %d\n', N_pred);
 fprintf('Total Sim Steps: %d\n', N_total);
+fprintf('Trajectory: %s\n', SCENARIO);
 fprintf('--------------------------------\n');

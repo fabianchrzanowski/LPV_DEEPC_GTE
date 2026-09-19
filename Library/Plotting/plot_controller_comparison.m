@@ -1,17 +1,20 @@
 % ========================================================================
-% Controller Comparison Dashboard (Modular)
+% Controller Comparison
 %
 % This script scans the Results/ folder for any generated controller
 % data files. It allows the user to select which controllers to plot
 % via the command window, and dynamically generates the comparison plots.
 % ========================================================================
-% Fabian Chrzanowski — University of Sheffield — 2026
-% ========================================================================
 
 clearvars; close all; clc
 plot_options;
 
-proj = currentProject;
+% ===== USER CONFIGURATION =====
+% Toggle to plot vertical lines for database (Hankel) switches
+SHOW_SWITCH_LINES = false; 
+% ==============================
+
+try proj = currentProject; catch; proj = openProject('GTE.prj'); end
 cd(proj.RootFolder)
 
 results_dir = fullfile(proj.RootFolder, 'Results');
@@ -46,7 +49,7 @@ end
 
 % Ask user which ones to plot
 disp(' ');
-selection = input('Enter the numbers of the controllers to plot as an array (e.g., [1, 2, 4]), or press Enter for all: ');
+selection = input('Enter the controllers (e.g., [1, 2, 4]), or Enter for all: ');
 
 if isempty(selection)
     selection = 1:length(files);
@@ -68,18 +71,29 @@ for idx = 1:length(selection)
     loaded_data(idx).name = available_results{i};
 end
 
-% Assume all controllers were run with the same setup_simulation_params
-% so they share the same time vector and reference plot.
-time = loaded_data(1).data.time;
-ref_plot = loaded_data(1).data.ref_plot;
-track_name = loaded_data(1).data.track_name;
-
-N_total = length(time);
-% In setup_simulation_params, T_ini = 10, steps_per_seg = 200
-T_ini = 10;
-steps_per_seg = 200;
+% Find the global time vector (the longest one, which includes warmup)
+max_len = 0;
+for i = 1:length(loaded_data)
+    if length(loaded_data(i).data.time) > max_len
+        time = loaded_data(i).data.time;
+        ref_plot = loaded_data(i).data.ref_plot;
+        track_name = loaded_data(i).data.track_name;
+        max_len = length(time);
+    end
+end
+N_total = max_len;
+% In setup_simulation_params, T_ini = 20, steps_per_seg = 15 or 50
+T_ini = 20;
 Ts = 0.015;
-seg_bounds = T_ini*Ts + (1:2)*steps_per_seg*Ts;
+N_sim = N_total - T_ini;
+
+% OVERRIDE time vector so t=0 is the start of the active control phase
+time = (-T_ini : N_sim-1)' * Ts;
+% ref_plot is already loaded correctly
+
+% Assuming standard scenario for segment boundaries (can be generalized)
+steps_per_seg = (N_sim) / 3; % rough estimate for drawing vertical lines
+seg_bounds = (1:2)*steps_per_seg*Ts;
 
 % Calculate RMSEs (evaluating from step T_ini+1 to end)
 idx_eval = (T_ini+1) : N_total;
@@ -89,16 +103,23 @@ disp(' ');
 disp('--- Root Mean Square Error (RMSE) ---');
 for idx = 1:length(selection)
     y = loaded_data(idx).data.y_hist;
-    % Align arrays if one was missing warmup padding (e.g. MPC vs DeePC)
+    u = loaded_data(idx).data.u_hist;
+    
+    % If an array is shorter than N_total, pad it at the END 
+    % so its internal indices (like the jump at t=36) stay aligned with DeePC
     if length(y) < N_total
-        % Pad start with NaNs
-        y = [nan(N_total - length(y), 1); y];
-        loaded_data(idx).data.y_hist = y; % Save back
-        
-        u = loaded_data(idx).data.u_hist;
-        u = [nan(N_total - length(u), 1); u];
-        loaded_data(idx).data.u_hist = u;
+        y = [y; nan(N_total - length(y), 1)];
+        u = [u; nan(N_total - length(u), 1)];
     end
+    
+    % Fill warmup NaNs for DeePC so its line visually starts at t=0
+    if length(y) == N_total && sum(isnan(y(1:T_ini))) > 0
+        y(1:T_ini) = y(T_ini+1);
+        u(1:T_ini) = u(T_ini+1);
+    end
+    
+    loaded_data(idx).data.y_hist = y; % Save back for plotting
+    loaded_data(idx).data.u_hist = u;
     
     rmse = sqrt(mean((y(idx_eval) - ref_plot(idx_eval)).^2, 'omitnan'));
     rmses(idx) = rmse;
@@ -108,7 +129,7 @@ end
 %% ===== Plot Dashboard =====
 fprintf('\nGenerating dashboard plots...\n');
 
-% Define a robust color palette
+% Define color palette
 colors = [
     0.85 0.33 0.10;   % Orange (Frozen MPC)
     0.00 0.45 0.74;   % Blue (LPV MPC)
@@ -118,57 +139,105 @@ colors = [
     0.49 0.18 0.56;   % Violet
 ];
 
-% --- Figure 1: Tracking Performance ---
-figure('Name','Controller Comparison: Tracking', 'Units', 'pixels', 'Position', [100 100 900 600]);
+% --- Figure 1: Tracking Performance & Control Effort ---
+fig1 = figure('Name','Controller Comparison: Tracking & Control Effort');
 tiledlayout(2,1, 'TileSpacing','compact', 'Padding','compact');
 
 ax1 = nexttile; hold(ax1, 'on');
+
 plot(ax1, time, ref_plot, 'k--', 'LineWidth', 1.5, 'DisplayName', 'Reference');
 
 for idx = 1:length(selection)
     c_idx = mod(idx-1, size(colors,1)) + 1;
     lw = 1.2;
     if contains(loaded_data(idx).name, 'LPV')
-        lw = 1.5; % Make LPV lines slightly thicker
+        lw = 1.8; % Make LPV lines thicker and clear
     end
-    plot(ax1, loaded_data(idx).data.time, loaded_data(idx).data.y_hist, '-', 'Color', colors(c_idx, :), ...
-        'LineWidth', lw, 'DisplayName', sprintf('%s (RMSE: %.0f)', loaded_data(idx).name, rmses(idx)));
+    
+    clean_name = strrep(loaded_data(idx).name, '_', '\_');
+    % Use the globally aligned 'time' vector, not the internal one which might not be padded
+    plot(ax1, time, loaded_data(idx).data.y_hist, '-', 'Color', colors(c_idx, :), ...
+        'LineWidth', lw, 'DisplayName', sprintf('%s (RMSE: %.0f)', clean_name, rmses(idx)));
 end
 
 for ii=1:length(seg_bounds)
     xline(ax1, seg_bounds(ii), 'k:', 'HandleVisibility', 'off');
 end
-ylabel(ax1, sprintf('%s [rpm]', track_name), 'Interpreter', 'none');
-title(ax1, 'Controller Comparison: Tracking Performance Across Envelope', 'Interpreter', 'none');
-legend(ax1, 'Location', 'best', 'Interpreter', 'none');
+
+% Format track name for LaTeX
+if contains(lower(track_name), 'n_h')
+    ytarget_label = '$N_H$ [rpm]';
+elseif contains(lower(track_name), 'n_l')
+    ytarget_label = '$N_L$ [rpm]';
+else
+    ytarget_label = strrep(track_name, '_', '\_');
+end
+
+ylabel(ax1, ytarget_label, 'Interpreter', 'latex', 'FontSize', 12);
+title(ax1, 'Tracking Performance Across Envelope', 'Interpreter', 'latex', 'FontSize', 13);
+legend(ax1, 'Location', 'best', 'Interpreter', 'latex', 'FontSize', 10);
 grid(ax1, 'on');
+set(ax1, 'TickLabelInterpreter', 'latex', 'FontSize', 11);
 
 ax2 = nexttile; hold(ax2, 'on');
+
 for idx = 1:length(selection)
     c_idx = mod(idx-1, size(colors,1)) + 1;
     lw = 1.2;
     if contains(loaded_data(idx).name, 'LPV')
-        lw = 1.5;
+        lw = 1.8;
     end
-    plot(ax2, loaded_data(idx).data.time, loaded_data(idx).data.u_hist, '-', 'Color', colors(c_idx, :), 'LineWidth', lw);
+    stairs(ax2, time, loaded_data(idx).data.u_hist, '-', 'Color', colors(c_idx, :), 'LineWidth', lw);
 end
 
 for ii=1:length(seg_bounds)
     xline(ax2, seg_bounds(ii), 'k:', 'HandleVisibility', 'off');
 end
-ylabel(ax2, 'W_f [pps]', 'Interpreter', 'none');
-xlabel(ax2, 'Time [s]');
-title(ax2, 'Control Effort (Fuel Flow)', 'Interpreter', 'none');
+ylabel(ax2, '$W_f$ [pps]', 'Interpreter', 'latex', 'FontSize', 12);
+xlabel(ax2, 'Time [s]', 'Interpreter', 'latex', 'FontSize', 12);
+title(ax2, 'Control Effort (Fuel Flow)', 'Interpreter', 'latex', 'FontSize', 13);
 grid(ax2, 'on');
+set(ax2, 'TickLabelInterpreter', 'latex', 'FontSize', 11);
 
-% --- Figure 2: Tracking Error Bar Chart ---
-figure('Name', 'Controller Comparison: Error Summary', 'Units', 'pixels', 'Position', [1050 100 500 300]);
-b = bar(categorical({loaded_data.name}), rmses);
+% --- Figure 2: Scheduling Variable ---
+deepc_idx = find(cellfun(@(x) contains(lower(x), 'lpv') && contains(lower(x), 'deepc'), {loaded_data.name}), 1);
+if ~isempty(deepc_idx) && isfield(loaded_data(deepc_idx).data, 'wf_scheduler_hist')
+    fig2 = figure('Name','Controller Comparison: Scheduling Variable');
+    ax3 = axes(fig2); hold(ax3, 'on');
+    
+    wf_sched = loaded_data(deepc_idx).data.wf_scheduler_hist;
+    
+    % Ensure t_sched is EXACTLY the same length as wf_sched by taking the
+    % active portion of the globally defined 'time' vector.
+    t_sched = time(end - length(wf_sched) + 1 : end);
+    
+    stairs(ax3, t_sched, wf_sched, 'LineWidth', 1.8, 'Color', colors(4, :)); % Green color for LPV DeePC
+    
+    for ii=1:length(seg_bounds)
+        xline(ax3, seg_bounds(ii), 'k:', 'HandleVisibility', 'off');
+    end
+    ylabel(ax3, 'Active OP ($W_f$) [pps]', 'Interpreter', 'latex', 'FontSize', 12);
+    xlabel(ax3, 'Time [s]', 'Interpreter', 'latex', 'FontSize', 12);
+    title(ax3, 'Controller Comparison: Scheduling Variable Trace', 'Interpreter', 'latex', 'FontSize', 13);
+    grid(ax3, 'on');
+    set(ax3, 'TickLabelInterpreter', 'latex', 'FontSize', 11);
+end
+
+% --- Figure 3: Tracking Error Bar Chart ---
+figure('Name', 'Controller Comparison: Error Summary');
+b = bar(rmses);
+xticks(1:length(selection));
+clean_names = cell(length(loaded_data), 1);
+for idx = 1:length(loaded_data)
+    clean_names{idx} = strrep(loaded_data(idx).name, '_', '\_');
+end
+xticklabels(clean_names);
+set(gca, 'TickLabelInterpreter', 'latex', 'FontSize', 11);
 b.FaceColor = 'flat';
 for idx = 1:length(selection)
     c_idx = mod(idx-1, size(colors,1)) + 1;
     b.CData(idx,:) = colors(c_idx, :);
 end
-ylabel('RMSE [rpm]');
-title('Tracking Error Comparison', 'Interpreter', 'none');
+ylabel('RMSE [rpm]', 'Interpreter', 'latex', 'FontSize', 12);
+title('Tracking Error Comparison', 'Interpreter', 'latex', 'FontSize', 13);
 grid on;

@@ -47,6 +47,4 @@
     set(groot, 'defaultAxesXGrid','on')
     set(groot, 'defaultAxesYGrid','on')
 
-    % set figure size and 
-    set(groot, 'defaultFigureUnits', 'centimeters', ...
-               'defaultFigurePosition', [0 0 30 20]);
+    % Keep it simple — no global figure sizing or positioning to prevent crashes.

@@ -1,16 +1,15 @@
 % Always load latest params
 run('setup_simulation_params.m');
 % ========================================================================
-% LPV-DeePC: Gain-Scheduled Data-Enabled Predictive Control
+% LPV-DeePC
 %
-% Instead of one big Hankel from all operating points, build a separate
-% Hankel at each Wf. At runtime, select the Hankel closest to the
-% current operating point — same scheduling idea as LPV-MPC.
+% Builds a seperate Hankel at each Wf. At runtime selects the Hankel
+% closest to the current point.
 %
-% Uses CasADi + IPOPT. One solver pre-built per operating point.
+% Uses CasADi & IPOPT
 % ========================================================================
 
-proj = currentProject;
+try proj = currentProject; catch; proj = openProject('GTE.prj'); end
 cd(proj.RootFolder)
 
 import casadi.*
@@ -34,15 +33,22 @@ fprintf('Tracking output #%d: %s (equilibrium = %.1f)\n', idx_track, track_name,
 
 u_min = 0.35;
 u_max = 2.0;
-du_max = 0.2;
+du_max = 0.15;
 
-q_track = 1;
+q_track = 15;
 r_u = 1;
-r_du = 25;
-lambda_g = 50;        % Heavily penalize large g to prevent overfitting to DC offsets
-lambda_sigma = 10;    % Allow sigma to easily absorb DC offset mismatches
+r_du = 1;
+lambda_g = 300;        % Heavily penalize large g to prevent overfitting to DC offsets
+lambda_sigma = 1e5;    % Allow sigma to easily absorb DC offset mismatches
 
-max_cols_per_wf = 3000;
+
+% OVERRIDE_NUM_HANKELS = 2;
+
+if exist('OVERRIDE_MAX_COLS', 'var')
+    max_cols_per_wf = OVERRIDE_MAX_COLS;
+else
+    max_cols_per_wf = 3000;
+end
 n_sys = 4;
 
 % The trajectory ref is now sourced from setup_simulation_params.m
@@ -51,7 +57,16 @@ n_sys = 4;
 filelist = dir(fullfile(training_folder,'*.mat'));
 [~,idx_sort] = sort({filelist.name});
 filelist = filelist(idx_sort);
-n_op = min(numel(filelist), numel(wf_values));
+
+if exist('OVERRIDE_NUM_HANKELS', 'var') && OVERRIDE_NUM_HANKELS < numel(filelist)
+    keep_idx = unique(round(linspace(1, numel(filelist), OVERRIDE_NUM_HANKELS)));
+    filelist = filelist(keep_idx);
+    hankel_wf = wf_values(keep_idx);
+    n_op = numel(filelist);
+else
+    n_op = min(numel(filelist), numel(wf_values));
+    hankel_wf = wf_values(1:n_op);
+end
 
 fprintf('Building per-Wf Hankels (%d operating points)...\n', n_op);
 
@@ -59,7 +74,7 @@ hankel_U = cell(n_op, 1);
 hankel_Y = cell(n_op, 1);
 hankel_rank = zeros(n_op, 1);
 hankel_cols = zeros(n_op, 1);
-hankel_wf = wf_values(1:n_op);
+% hankel_wf already defined
 hankel_u_mean = zeros(n_op, 1);  % mean input at each operating point
 hankel_y_mean = zeros(n_op, 1);  % mean output at each operating point
 
@@ -88,10 +103,23 @@ for k = 1:n_op
     Hu = block_hankel(du(:), L);
     Hy = block_hankel(dy(:), L);
 
-    % Rank check
-    r = rank([Hu; Hy]);
+    % Input must be persistently exciting of order L + n_sys
+    Hu_check = block_hankel(du(:), L + n_sys);
+    
+    % start extracting columns at t=19.5s when the PRBS signal actually begins.
+    req_cols = 2 * (L + n_sys);
+    t_raw = out_dyn.eng.S0.W.Time(:);
+    idx_prbs = find(t_raw >= 19.5, 1);
+    
+    if ~isempty(idx_prbs) && size(Hu_check, 2) >= (idx_prbs + req_cols - 1)
+        Hu_check = Hu_check(:, idx_prbs : idx_prbs + req_cols - 1);
+    elseif size(Hu_check, 2) >= req_cols
+        Hu_check = Hu_check(:, end-req_cols+1 : end); % Fallback
+    end
+    
+    r = svd_rank(Hu_check, 1e-6);
     hankel_rank(k) = r;
-    rank_needed = L + n_sys;
+    rank_needed = min(L + n_sys, min(size(Hu_check)));
 
     % Downsample
     nc = size(Hu, 2);
@@ -124,7 +152,6 @@ n_valid = sum(valid);
 fprintf('\nValid Hankels: %d / %d\n', n_valid, n_op);
 
 %% ===== Pre-build one CasADi solver per operating point =====
-fprintf('Pre-building %d CasADi solvers...\n', n_valid);
 tic;
 
 % Standardise column count (pad smaller ones with zeros)
@@ -178,6 +205,7 @@ n_eq = length(g_eq);
 
 nlp = struct('x', x, 'f', obj, 'g', g_all, 'p', p);
 opts = struct;
+% opts.qpsol = 'qpoases';
 opts.ipopt.print_level = 0;
 opts.print_time = 0;
 opts.ipopt.max_iter = 200;
@@ -191,68 +219,73 @@ S.n_x = n_cols_std + N_pred + N_pred + T_ini;
 S.n_cols = n_cols_std;
 
 build_time = toc;
-fprintf('Single parameterized CasADi solver built in %.1f s\n', build_time);
+fprintf('CasADi solver built in %.1f s\n', build_time);
 
-if ~FAST_SURROGATE_MODE
-    % Build baseline MWS once
-    MWS = struct(); % Prevent old arrays from causing dimension mismatch on 2nd run
-    MWS.engName = 'AGTF30';
-    MWS = setup_Controller(MWS);
-    MWS = setup_AllEng(MWS);
+% Build baseline MWS once
+MWS = struct(); % Prevent old arrays from causing dimension mismatch on 2nd run
+MWS.engName = 'AGTF30';
+MWS = setup_Controller(MWS);
+MWS = setup_AllEng(MWS);
 
-    busVars = load(fullfile(proj.RootFolder,'Params','Eng_Bus.mat'));
-    busVarNames = fieldnames(busVars);
-    for ib = 1:numel(busVarNames)
-        assignin('base',busVarNames{ib},busVars.(busVarNames{ib}));
-    end
-
-    MWS.In.Ts = Ts;
-    MWS.In.Tsim = Ts;
-    MWS.In.Alt = timeseries([0;0],[0 Ts],'Name','Alt');
-    MWS.In.MN  = timeseries([0;0],[0 Ts],'Name','MN');
-    MWS.In.dT  = timeseries([0;0],[0 Ts],'Name','dT');
-    MWS.In.dVBV = timeseries([0;0],[0 Ts],'Name','dVBV');
-    MWS.In.dNz  = timeseries([0;0],[0 Ts],'Name','dNz');
-    MWS.In.Wf   = timeseries([u0;u0],[0 Ts],'Name','Wf');
-    MWS = AGTF30_initial_conditions(MWS);
+busVars = load(fullfile(proj.RootFolder,'Params','Eng_Bus.mat'));
+busVarNames = fieldnames(busVars);
+for ib = 1:numel(busVarNames)
+    assignin('base',busVarNames{ib},busVars.(busVarNames{ib}));
 end
+
+MWS.In.Ts = Ts;
+MWS.In.Tsim = Ts;
+MWS.In.Alt = timeseries([0;0],[0 Ts],'Name','Alt');
+MWS.In.MN  = timeseries([0;0],[0 Ts],'Name','MN');
+MWS.In.dT  = timeseries([0;0],[0 Ts],'Name','dT');
+MWS.In.dVBV = timeseries([0;0],[0 Ts],'Name','dVBV');
+MWS.In.dNz  = timeseries([0;0],[0 Ts],'Name','dNz');
+MWS.In.Wf   = timeseries([u0;u0],[0 Ts],'Name','Wf');
+MWS = AGTF30_initial_conditions(MWS);
 
 model = 'AGTF30SysDyn';
 
 %% ===== Closed-loop =====
 u_hist = zeros(N_total,1);
 y_hist = nan(N_total,1);
+nl_hist = nan(N_total,1);
+nh_hist = nan(N_total,1);
+sm_hpc_hist = nan(N_total,1);
+g_hist_matrix = zeros(N_sim, S.n_cols);
+sigma_hist = zeros(N_sim, T_ini);
+cost_track_hist = zeros(N_sim, 1);
+cost_du_hist = zeros(N_sim, 1);
+cost_g_hist = zeros(N_sim, 1);
+cost_sigma_hist = zeros(N_sim, 1);
 u_hist(1:T_ini) = u0;
 u_prev = u0;
-if FAST_SURROGATE_MODE
-    x_plant_fast = zeros(size(models.A_dt,1),1);
-end
 x0_guess = zeros(S.n_x, 1);
 solve_times = zeros(N_sim, 1);
 sched_idx = zeros(N_sim, 1);
 wf_scheduler_hist = zeros(N_sim, 1);
+cost_hist = zeros(N_sim, 1);
 
 % Warm-up
 fprintf('Warm-up (%d steps)...\n', T_ini);
 for t = 1:T_ini
-    if FAST_SURROGATE_MODE
-        [y_hist(t), x_plant_fast] = LPV_step_fast(x_plant_fast, u0, u0, models);
-    else
-        t_step = (0:t)'*Ts;
-        u_step = [u0; u_hist(1:t)];
-        MWS.In.Tsim = t_step(end);
-        MWS.In.Alt  = timeseries([0;0],[0 t_step(end)],'Name','Alt');
-        MWS.In.MN   = timeseries([0;0],[0 t_step(end)],'Name','MN');
-        MWS.In.dT   = timeseries([0;0],[0 t_step(end)],'Name','dT');
-        MWS.In.dVBV = timeseries([0;0],[0 t_step(end)],'Name','dVBV');
-        MWS.In.dNz  = timeseries([0;0],[0 t_step(end)],'Name','dNz');
-        MWS.In.Wf   = timeseries(u_step, t_step, 'Name','Wf');
-        simIn = Simulink.SimulationInput(model);
-        simIn = simIn.setVariable('MWS',MWS);
-        simIn = simIn.setModelParameter('StartTime','0','StopTime',num2str(t_step(end)),'ReturnWorkspaceOutputs','on');
-        simOut = sim(simIn);
-        y_hist(t) = measure_tracking_output(fetch_out_dyn(simOut), track_name);
-    end
+    t_step = (0:t)'*Ts;
+    u_step = [u0; u_hist(1:t)];
+    MWS.In.Tsim = t_step(end);
+    MWS.In.Alt  = timeseries([0;0],[0 t_step(end)],'Name','Alt');
+    MWS.In.MN   = timeseries([0;0],[0 t_step(end)],'Name','MN');
+    MWS.In.dT   = timeseries([0;0],[0 t_step(end)],'Name','dT');
+    MWS.In.dVBV = timeseries([0;0],[0 t_step(end)],'Name','dVBV');
+    MWS.In.dNz  = timeseries([0;0],[0 t_step(end)],'Name','dNz');
+    MWS.In.Wf   = timeseries(u_step, t_step, 'Name','Wf');
+    simIn = Simulink.SimulationInput(model);
+    simIn = simIn.setVariable('MWS',MWS);
+    simIn = simIn.setModelParameter('StartTime','0','StopTime',num2str(t_step(end)),'ReturnWorkspaceOutputs','on');
+    simOut = sim(simIn);
+    out_dyn_k = fetch_out_dyn(simOut);
+    y_hist(t) = measure_tracking_output(out_dyn_k, track_name);
+    nl_hist(t) = out_dyn_k.eng.Shaft.N_Fan.Data(end);
+    nh_hist(t) = out_dyn_k.eng.Shaft.N_HPC.Data(end);
+    sm_v = sv(out_dyn_k.eng.SM.SMHPC); sm_hpc_hist(t) = sm_v(end);
 end
 
 % Control loop
@@ -261,7 +294,9 @@ fprintf('LPV-DeePC closed-loop (%d steps)...\n', N_sim);
 for t = T_ini+1:N_total
     si = t - T_ini;
 
-    % Schedule: pick closest Wf operating point
+    % ---- STEP 1: LPV scheduling ----
+    % Pick the Hankel closest to the current fuel flow.
+    % A low-pass filter smooths the scheduling to avoid chattering.
     wf_for_sched = max(min(u_prev, max(hankel_wf)), min(hankel_wf));  % clamp to Hankel range
     if si == 1
         wf_filtered = wf_for_sched;
@@ -273,7 +308,8 @@ for t = T_ini+1:N_total
     sched_idx(si) = k_sel;
     wf_scheduler_hist(si) = hankel_wf(k_sel);
 
-    % Convert to deviation space for the selected operating point
+    % ---- STEP 2: Convert signals to deviation space ----
+    % Subtract the operating-point means so the Hankel data is consistent.
     u_mean_k = hankel_u_mean(k_sel);
     y_mean_k = hankel_y_mean(k_sel);
 
@@ -283,7 +319,8 @@ for t = T_ini+1:N_total
     du_prev = u_prev - u_mean_k;
     du0 = u0 - u_mean_k;
 
-    % Fetch and pad Hankel matrices for current scheduler
+    % ---- STEP 3: Load the Hankel matrices for the selected operating point ----
+    % Pad with zeros if this Hankel has fewer columns than the solver expects.
     nc_sel = hankel_cols(k_sel);
     Hu_sel = hankel_U{k_sel};
     Hy_sel = hankel_Y{k_sel};
@@ -296,12 +333,22 @@ for t = T_ini+1:N_total
     Yp_sel = Hy_sel(1:T_ini, :);
     Yf_sel = Hy_sel(T_ini+1:end, :);
 
+    % Pack all parameters into a single vector for CasADi
     p_val = [du_ini; dy_ini; dref_seg; du_prev; du0; Up_sel(:); Yp_sel(:); Uf_sel(:); Yf_sel(:)];
 
-    % Dynamically set bounds centered around u_mean_k
-    lbx = [-inf(S.n_cols,1); (u_min - u_mean_k)*ones(N_pred,1); -inf(N_pred,1); -inf(T_ini,1)];
-    ubx = [ inf(S.n_cols,1); (u_max - u_mean_k)*ones(N_pred,1);  inf(N_pred,1);  inf(T_ini,1)];
+    % ---- STEP 4: Set variable bounds ----
+    % Pin zero-padded g elements to zero so regulariser only acts on real data.
+    % Input bounds are shifted into deviation space.
+    g_lb = -inf(S.n_cols, 1);
+    g_ub =  inf(S.n_cols, 1);
+    if nc_sel < S.n_cols
+        g_lb(nc_sel+1:end) = 0;  % pin padded columns to zero
+        g_ub(nc_sel+1:end) = 0;
+    end
+    lbx = [g_lb; (u_min - u_mean_k)*ones(N_pred,1); -inf(N_pred,1); -inf(T_ini,1)];
+    ubx = [g_ub; (u_max - u_mean_k)*ones(N_pred,1);  inf(N_pred,1);  inf(T_ini,1)];
 
+    % ---- STEP 5: Solve the DeePC optimisation (warm-started) ----
     tic;
     sol = S.solver('x0', x0_guess, 'p', p_val, ...
                    'lbx', lbx, 'ubx', ubx, ...
@@ -309,9 +356,32 @@ for t = T_ini+1:N_total
     solve_times(si) = toc;
 
     x_sol = full(sol.x);
-    x0_guess = x_sol;
-
-    % Convert back from deviation space to absolute
+    cost_hist(si) = full(sol.f);
+    x0_guess = x_sol;  % warm-start the next solve
+    
+    % ---- STEP 6: Extract decision variables for diagnostics ----
+    g_opt = x_sol(1:S.n_cols);
+    U_opt = x_sol(S.n_cols+1 : S.n_cols+N_pred);
+    Y_opt = x_sol(S.n_cols+N_pred+1 : S.n_cols+2*N_pred);
+    sigma_opt = x_sol(end-T_ini+1 : end);
+    
+    g_hist_matrix(si,:) = g_opt';
+    sigma_hist(si,:) = sigma_opt';
+    
+    % Break the total cost into its individual components for analysis
+    c_y = 0; c_du = 0; c_u = 0;
+    for i=1:N_pred
+        c_y = c_y + q_track*(Y_opt(i) - dref_seg(i))^2;
+        c_u = c_u + r_u*(U_opt(i) - du0)^2;
+        if i==1; c_du = c_du + r_du*(U_opt(i) - du_prev)^2;
+        else;    c_du = c_du + r_du*(U_opt(i) - U_opt(i-1))^2; end
+    end
+    cost_track_hist(si) = c_y;
+    cost_du_hist(si) = c_du + c_u;
+    cost_g_hist(si) = lambda_g * (g_opt'*g_opt);
+    cost_sigma_hist(si) = lambda_sigma * (sigma_opt'*sigma_opt);
+    
+    % ---- STEP 7: Extract the first optimal input and convert back to absolute ----
     du_now = x_sol(S.n_cols + 1);
     u_now = du_now + u_mean_k;
     
@@ -320,35 +390,36 @@ for t = T_ini+1:N_total
         u_now = u_prev;
     end
     
-    u_now = max(u_min, min(u_max, u_now));  % clamp
+    u_now = max(u_min, min(u_max, u_now));  % clamp to actuator limits
     u_hist(t) = u_now;
     
-    if mod(t, 5) == 0 || t == 1
-        fprintf('Step %d / %d | u_now: %.4f pps | wf_sched: %.4f\n', t, N_total, u_now, wf_filtered);
-    end
+    % if mod(t, 5) == 0 || t == 1
+    %     fprintf('Step %d / %d | u_now: %.4f pps | wf_sched: %.4f\n', t, N_total, u_now, wf_filtered);
+    % end
 
-    % Simulate
-    if FAST_SURROGATE_MODE
-        [y_hist(t), x_plant_fast] = LPV_step_fast(x_plant_fast, u_now, wf_filtered, models);
-    else
-        t_step = (0:t)'*Ts;
-        u_step = [u0; u_hist(1:t)];
-        MWS.In.Tsim = t_step(end);
-        MWS.In.Alt  = timeseries([0;0],[0 t_step(end)],'Name','Alt');
-        MWS.In.MN   = timeseries([0;0],[0 t_step(end)],'Name','MN');
-        MWS.In.dT   = timeseries([0;0],[0 t_step(end)],'Name','dT');
-        MWS.In.dVBV = timeseries([0;0],[0 t_step(end)],'Name','dVBV');
-        MWS.In.dNz  = timeseries([0;0],[0 t_step(end)],'Name','dNz');
-        MWS.In.Wf   = timeseries(u_step, t_step, 'Name','Wf');
-        simIn = Simulink.SimulationInput(model);
-        simIn = simIn.setVariable('MWS',MWS);
-        simIn = simIn.setModelParameter('StartTime','0','StopTime',num2str(t_step(end)),'ReturnWorkspaceOutputs','on');
-        simOut = sim(simIn);
-        y_hist(t) = measure_tracking_output(fetch_out_dyn(simOut), track_name);
-    end
-
+    % ---- STEP 8: Simulate the nonlinear plant for one step ----
+    t_step = (0:t)'*Ts;
+    u_step = [u0; u_hist(1:t)];
+    MWS.In.Tsim = t_step(end);
+    MWS.In.Alt  = timeseries([0;0],[0 t_step(end)],'Name','Alt');
+    MWS.In.MN   = timeseries([0;0],[0 t_step(end)],'Name','MN');
+    MWS.In.dT   = timeseries([0;0],[0 t_step(end)],'Name','dT');
+    MWS.In.dVBV = timeseries([0;0],[0 t_step(end)],'Name','dVBV');
+    MWS.In.dNz  = timeseries([0;0],[0 t_step(end)],'Name','dNz');
+    MWS.In.Wf   = timeseries(u_step, t_step, 'Name','Wf');
+    simIn = Simulink.SimulationInput(model);
+    simIn = simIn.setVariable('MWS',MWS);
+    simIn = simIn.setModelParameter('StartTime','0','StopTime',num2str(t_step(end)),'ReturnWorkspaceOutputs','on');
+    simOut = sim(simIn);
+    out_dyn_k = fetch_out_dyn(simOut);
+    y_hist(t) = measure_tracking_output(out_dyn_k, track_name);
+    nl_hist(t) = out_dyn_k.eng.Shaft.N_Fan.Data(end);
+    nh_hist(t) = out_dyn_k.eng.Shaft.N_HPC.Data(end);
+    sm_v = sv(out_dyn_k.eng.SM.SMHPC); sm_hpc_hist(t) = sm_v(end);
+    
+    % Update previous input for the next iteration
     u_prev = u_now;
-    if mod(si,20)==0
+    if mod(si,5)==0
         fprintf('  Step %d/%d  Wf=%.3f -> Hankel #%d (Wf=%.3f)  solve=%.1fms\n', ...
             si, N_sim, u_prev, k_sel, hankel_wf(k_sel), solve_times(si)*1000);
     end
@@ -356,9 +427,19 @@ end
 
 time = (0:N_total-1)'*Ts;
 ref_plot = ref(1:N_total);
-controller_name = 'LPV DeePC (Fast)';
-save('Results/results_lpv_deepc_fast.mat', 'y_hist', 'u_hist', 'wf_scheduler_hist', 'solve_times', 'time', 'ref_plot', 'controller_name', 'track_name');
-fprintf('Saved results to Results/results_lpv_deepc_fast.mat\n');
+scen_tag = lower(SCENARIO);
+if exist('OVERRIDE_MAT_FILENAME', 'var') && ~isempty(OVERRIDE_MAT_FILENAME)
+    mat_filename = OVERRIDE_MAT_FILENAME;
+else
+    mat_filename = sprintf('Results/results_lpv_deepc_fast_%s_%dcol_%dhank_lg%.0e_ls%.0e.mat', ...
+        scen_tag, max_cols_per_wf, n_op, lambda_g, lambda_sigma);
+end
+controller_name = sprintf('LPV DeePC (Fast) %s (%dcol, %dhank, \\lambda_g=%.0e, \\lambda_\\sigma=%.0e)', ...
+    SCENARIO, max_cols_per_wf, n_op, lambda_g, lambda_sigma);
+save(mat_filename, 'y_hist', 'u_hist', 'nl_hist', 'nh_hist', 'wf_scheduler_hist', ...
+    'cost_hist', 'cost_track_hist', 'cost_du_hist', 'cost_g_hist', 'cost_sigma_hist', ...
+    'g_hist_matrix', 'sigma_hist', 'sm_hpc_hist', 'solve_times', 'time', 'ref_plot', 'controller_name', 'track_name');
+fprintf('Saved results to %s\n', mat_filename);
 
 %% ===== Results =====
     control_time = time(T_ini+1:end);
@@ -409,6 +490,12 @@ function H = block_hankel(sig, L)
     sig = sig(:); nc = numel(sig)-L+1;
     H = zeros(L, nc);
     for i = 1:L; H(i,:) = sig(i:i+nc-1).'; end
+end
+
+function r = svd_rank(A, tol)
+    s = svd(A);
+    if isempty(s) || s(1) == 0; r = 0; return; end
+    r = sum(s > tol * s(1));
 end
 
 function out_dyn = fetch_out_dyn(data)

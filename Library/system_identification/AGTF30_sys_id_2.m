@@ -17,7 +17,7 @@
 clearvars;close all;clc
 
 plot_options;
-proj = currentProject; % proj = currentProject;
+try; proj = currentProject; catch; proj = openProject('GTE.prj'); end % try; proj = currentProject; catch; proj = openProject('GTE.prj'); end
 cd(proj.RootFolder)
 
 % location of data generated
